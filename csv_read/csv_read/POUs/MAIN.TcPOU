@@ -1,0 +1,253 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4022.12">
+  <POU Name="MAIN" Id="{9dbf08a7-7690-4f0b-879e-5ccbb41e2fb5}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+VAR
+	fbFileClose:FB_FileClose;
+	fbFileGets:FB_FileGets;
+	fbFileOpen:FB_FileOpen;
+	fbCSVMemBufferReader:FB_CSVMemBufferReader;
+	
+	sCSVField,sCSVLine,tmpString:T_MaxString;
+	fileName:STRING:='C:\Users\admin\Desktop\test data.csv';
+	lineIdx:INT;
+	Steps:eSteps;
+	bStart:BOOL;
+	strPara:ARRAY[1..20] OF STRING;
+	intVar:INT;
+	
+	POS_ARRAY_ORIGIN_NUM : INT := 20;
+	PosArrayOrigin:ARRAY[1..20] OF DINT;//字符数组转换为数值数组
+	
+	POS_ARRAY_NUM : INT := 250;
+	PosArray : ARRAY[1..250] OF DINT;
+	
+	ControlWord AT %Q* : UINT;//AT%Q*表示输出型,AT%I*表示输入型
+	TargetPosition AT %Q* : DINT;
+	OperationMode AT %Q* :SINT;
+	ActualPosition AT %I* :DINT;
+
+	ResetPulse1 : TON;
+	ResetPulse2 : TON;
+	PowerOnDelay1 : TON;
+	PowerOnDelay2 : TON;
+	HomingDelay1 : TON;
+
+	ResetCounter : CTU;
+
+	SwitchOn: BOOL := FALSE; (* 清除故障，上使能 *)
+	HomeSwitch : BOOL := FALSE; (* 回到起始位置 *)
+	OperationSwitch : BOOL := FALSE; (* 开始运行 *)
+	ResetFlag: BOOL := FALSE;
+	PowerFlag: BOOL := FALSE;
+	HomeFlag: BOOL := FALSE;
+	OperationInit: BOOL := FALSE;
+
+	temp : LREAL := 0;
+	HomingStep : DINT := 0;
+	HomingStep2 : DINT := 0;
+	HomingError : DINT := 0;
+	Count1 : INT := 0;
+	Count2 : INT := 0;
+	Point1: DINT := 0;
+	Point2: DINT := 0;
+	InterNum : INT := 0;
+
+	TIME_INTERVAL : TIME := t#10ms;
+	PULSE_POSITIVE : TIME := t#5ms;
+	PULSE_NEGATIVE : TIME := t#5ms;
+	POWER_ON_DELAY1 : TIME := t#1000ms;
+	POWER_ON_DELAY2 : TIME := t#1000ms;
+	TIME_STEP : TIME := t#1ms;
+	RESET_PULSE_NUM : WORD := 5;
+
+	HOME_POSITION : DINT := 0; (* 起始位置 *)
+	HOMING_VELOCITY : DINT := 200;
+
+	MODE_CSP : SINT := 8;
+	ENCODER_SINGLE : DINT := 8388608;
+	TIME_STEP_IN_SECOND : LREAL := 0.001;
+END_VAR
+
+    ]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[//读取csv文件内的位置点信息
+DEFAULT_CSV_FIELD_SEP:=16#2C;
+IF bStart THEN
+	CASE Steps OF
+		Step_init:
+			fbFileOpen(bExecute:=FALSE);
+			fbFileClose(bExecute:=FALSE);
+			fbFileGets(bExecute:=FALSE);
+			lineIdx:=1;
+			Steps:=Step_OpenFile;
+			
+		Step_OpenFile:
+			fbFileOpen(sNetId:='',sPathName:=fileName,nMode:=FOPEN_MODEREAD OR FOPEN_MODETEXT,ePath:=PATH_GENERIC,bExecute:=TRUE,tTimeOut:=T#3S,bBusy=> ,bError=> ,nErrId=> ,hFile=> );
+			IF NOT fbFileOpen.bBusy AND NOT fbFileOpen.bError THEN
+				Steps:=Step_GetFile;
+			END_IF
+			
+		Step_GetFile:
+			 fbFileGets(sNetId:='',hFile:=fbFileOpen.hFile,bExecute:=TRUE,tTimeout:=T#3S,bBusy=> , 
+                            bError=>,nErrId=> ,sLine=>sCSVLine,bEOF=> );
+                IF  NOT fbFileGets.bBusy AND NOT fbFileGets.bError THEN
+					IF RIGHT(STR:= sCSVLine,SIZE:= 1) = '$N' THEN
+                        sCSVLine:= REPLACE(STR1:=sCSVLine, STR2:='$r$n',L:=2,P:= LEN(STR:=sCSVLine) );                    
+                    END_IF
+					fbFileGets(bExecute:=FALSE);
+					Steps:=Step_Para;
+					
+				END_IF
+		
+		Step_Para:
+			fbCSVMemBufferReader(eCmd:=eEnumCmd_First,pBuffer:=ADR(sCSVLine),cbBuffer:=SIZEOF(sCSVLine)-1, 
+                    bOk=> ,getValue=>sCSVField, pValue=> ,cbValue=> ,bCRLF=> ,cbRead=> );
+            strPara[lineIdx]:= CSVFIELD_TO_STRING(in:=sCSVField,bQM:=FALSE);
+			lineIdx:= lineIdx+1;
+			IF lineIdx<21 THEN
+				Steps:=Step_GetFile;
+			ELSE
+				Steps:=Step_Close;
+			END_IF
+		
+		Step_Close:
+			fbFileClose(sNetId:='',hFile:=fbFileOpen.hFile,bExecute:=TRUE,tTimeout:=T#3S,bBusy=> ,bError=> ,nErrId=> );
+
+	END_CASE
+END_IF
+
+FOR intVar:=1 TO 20 BY 1 DO
+	PosArrayOrigin[intVar]:= STRING_TO_DINT(strPara[intVar]);
+END_FOR
+
+//主程序
+IF SwitchOn = TRUE THEN
+	OperationMode := MODE_CSP;//cyclic synchronous position mode
+	IF ResetFlag = FALSE THEN
+		ResetPulse1(IN := NOT ResetFlag AND NOT ResetPulse2.Q, PT := PULSE_POSITIVE);
+		ResetPulse2(IN := ResetPulse1.Q, PT := PULSE_NEGATIVE);
+		IF ResetPulse1.Q THEN
+			ControlWord := 128;//halt
+		ELSE
+			ControlWord := 6;//enable voltage
+		END_IF
+		ResetCounter(CU := ResetPulse1.Q, RESET := ResetCounter.Q, PV := RESET_PULSE_NUM);
+		IF ResetCounter.Q THEN
+			ResetFlag := TRUE;
+			PowerFlag := FALSE;
+			ControlWord := 6;
+		END_IF
+	ELSE
+		IF PowerFlag = FALSE THEN
+			IF ControlWord = 6 THEN
+				PowerOnDelay1(IN := NOT PowerOnDelay1.Q , PT := POWER_ON_DELAY1);
+				IF PowerOnDelay1.Q THEN
+					TargetPosition := ActualPosition;
+					ControlWord := 15;//enable operation
+				END_IF
+			END_IF
+			PowerOnDelay2(IN := (ControlWord = 15), PT := POWER_ON_DELAY2);
+			IF PowerOnDelay2.Q THEN
+				PowerFlag := TRUE;
+				HomeFlag := FALSE;
+			END_IF
+		END_IF
+	END_IF
+ELSE
+	ControlWord := 6;
+	ResetFlag := FALSE;
+	PowerFlag := FALSE;
+	HomeFlag := FALSE;
+	OperationInit := FALSE;
+END_IF
+
+IF HomeSwitch = TRUE AND HomeFlag = FALSE AND PowerFlag = TRUE AND NOT OperationSwitch THEN
+	temp := HOMING_VELOCITY / 60 * TIME_STEP_IN_SECOND;
+	HomingStep := LREAL_TO_DINT(temp * ENCODER_SINGLE);
+	HomingError := HomingStep / 50;
+	HomingStep2 := HomingStep / 100;
+	IF TargetPosition < HOME_POSITION + HomingStep AND TargetPosition > HOME_POSITION - HomingStep THEN
+		IF TargetPosition < HOME_POSITION + HomingError AND TargetPosition > HOME_POSITION - HomingError THEN
+			IF ActualPosition < HOME_POSITION + HomingError AND ActualPosition > HOME_POSITION - HomingError THEN
+				TargetPosition := ActualPosition;
+				HomeFlag := TRUE;
+				OperationInit := FALSE;
+			END_IF
+		ELSIF ActualPosition < HOME_POSITION - HomingError THEN
+			TargetPosition := TargetPosition + HomingStep2;
+		ELSIF ActualPosition > HOME_POSITION + HomingError THEN
+			TargetPosition := TargetPosition - HomingStep2;
+		END_IF
+	ELSIF TargetPosition < HOME_POSITION - HomingStep THEN
+		TargetPosition := TargetPosition + HomingStep;
+	ELSIF TargetPosition > HOME_POSITION + HomingStep THEN
+		TargetPosition := TargetPosition - HomingStep;
+	END_IF
+END_IF
+
+IF OperationSwitch = TRUE AND NOT HomeSwitch AND HomeFlag = TRUE THEN
+	IF OperationInit = FALSE THEN
+		Point1 := HOME_POSITION;
+		InterNum := POS_ARRAY_NUM / POS_ARRAY_ORIGIN_NUM;
+		FOR Count1 := 1 TO POS_ARRAY_ORIGIN_NUM BY 1 DO
+			Point2 := PosArrayOrigin[Count1];
+			FOR Count2 := (Count1-1) * InterNum + 1 TO Count1 * InterNum BY 1 DO
+				PosArray[Count2] := Point1 + (Point2 - Point1) / (InterNum) * ((Count2 -1) MOD InterNum);
+			END_FOR
+			Point1 := Point2;
+		END_FOR
+		FOR Count2 := Count2 TO  POS_ARRAY_NUM BY 1 DO
+			PosArray[Count2] := PosArray[Count2-1];
+		END_FOR
+
+		IF Count2 > POS_ARRAY_NUM  THEN
+			OperationInit := TRUE;
+			Count2 := 1;
+		END_IF
+	ELSE
+		IF Count2 <= POS_ARRAY_NUM THEN
+			TargetPosition := PosArray[Count2];
+			Count2 := Count2 + 1;
+		ELSE
+			OperationInit := FALSE;
+			HomeFlag := FALSE;
+		END_IF
+	END_IF
+END_IF]]></ST>
+    </Implementation>
+    <LineIds Name="MAIN">
+      <LineId Id="266" Count="0" />
+      <LineId Id="2" Count="0" />
+      <LineId Id="19" Count="1" />
+      <LineId Id="22" Count="0" />
+      <LineId Id="24" Count="4" />
+      <LineId Id="31" Count="0" />
+      <LineId Id="29" Count="0" />
+      <LineId Id="32" Count="3" />
+      <LineId Id="37" Count="1" />
+      <LineId Id="40" Count="2" />
+      <LineId Id="46" Count="2" />
+      <LineId Id="30" Count="0" />
+      <LineId Id="51" Count="0" />
+      <LineId Id="53" Count="0" />
+      <LineId Id="52" Count="0" />
+      <LineId Id="54" Count="1" />
+      <LineId Id="58" Count="2" />
+      <LineId Id="76" Count="0" />
+      <LineId Id="63" Count="1" />
+      <LineId Id="66" Count="1" />
+      <LineId Id="65" Count="0" />
+      <LineId Id="68" Count="1" />
+      <LineId Id="75" Count="0" />
+      <LineId Id="56" Count="0" />
+      <LineId Id="23" Count="0" />
+      <LineId Id="98" Count="0" />
+      <LineId Id="100" Count="2" />
+      <LineId Id="99" Count="0" />
+      <LineId Id="265" Count="0" />
+      <LineId Id="172" Count="92" />
+      <LineId Id="171" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>
